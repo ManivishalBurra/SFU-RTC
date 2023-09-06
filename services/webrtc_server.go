@@ -2,14 +2,25 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/gorilla/websocket"
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
+	"io"
 	"meshRTC/models"
 	"time"
 )
 
 var MasterPeerConnectionMappedToUser = make(map[string]*webrtc.PeerConnection)
+
+type StreamInfo struct {
+	AudioStream *webrtc.TrackRemote
+	VideoStream *webrtc.TrackRemote
+	Receiver    *webrtc.RTPReceiver
+}
+
+var RemotePeerInfo = []StreamInfo{}
 
 func SetUpMasterPeerConnection() {
 	time.Sleep(5 * time.Second)
@@ -85,16 +96,21 @@ func SetUpMasterPeerConnection() {
 func PrepareNewPeerConnection(ws1 *websocket.Conn, u1 *models.User, msg models.Message) (*webrtc.PeerConnection, error) {
 
 	//create a new WebRTC API
-	mediaEngineParams := webrtc.MediaEngine{}
+	mediaEngineParams := &webrtc.MediaEngine{}
 
 	//Setting mediaEnginesParams Default Codecs that Pion provides
 	err := mediaEngineParams.RegisterDefaultCodecs()
 	if err != nil {
 		fmt.Println(err)
 	}
+	i := &interceptor.Registry{}
+	// Use the default set of Interceptors
+	if err := webrtc.RegisterDefaultInterceptors(mediaEngineParams, i); err != nil {
+		panic(err)
+	}
 
 	//NewAPI Creates a new API object for keeping semi-global settings to WebRTC objects
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngineParams))
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngineParams))
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -109,17 +125,30 @@ func PrepareNewPeerConnection(ws1 *websocket.Conn, u1 *models.User, msg models.M
 		panic(err)
 	}
 
-	//// Create an audio track
-	//audioTrack, err := createAudioTrack()
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
+	// Allow us to receive 1 video track
+	if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+		panic(err)
+	}
+
+	// Create an audio track from the microphone
+	//mediaStream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{})
 	//
-	//// Add the audio track to the peer connection
-	//_, err = peerConnection.AddTrack(audioTrack)
-	//if err != nil {
-	//	log.Fatal(err)
+	//// Add the audio tracks to the PeerConnection
+	//audioTracks := mediaStream.GetTracks()
+	//
+	//for _, audioTrack := range audioTracks {
+	//	_, err = peerConnection.AddTrack(audioTrack)
+	//	if err != nil {
+	//		log.Fatal(err)
+	//	}
 	//}
+
+	peerConnection.OnDataChannel(func(dataChannel *webrtc.DataChannel) {
+		dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
+			fmt.Println(string(msg.Data))
+			dataChannel.SendText("I received")
+		})
+	})
 
 	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate != nil {
@@ -143,9 +172,56 @@ func PrepareNewPeerConnection(ws1 *websocket.Conn, u1 *models.User, msg models.M
 	})
 
 	// Set up the OnTrack event handler to handle incoming tracks
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		fmt.Printf("Received a remote track: %s\n", track.ID())
+	peerConnection.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		fmt.Printf("Received a remote track: %s\n", remoteTrack.ID())
 		// Handle the incoming track here (e.g., play the audio or display the video)
+		localTrackHelper, err := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, remoteTrack.ID(), remoteTrack.StreamID())
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		_, err = peerConnection.AddTrack(localTrackHelper)
+		if err != nil {
+			return
+		}
+
+		rtpBuf := make([]byte, 1400)
+		for {
+			i, _, readErr := remoteTrack.Read(rtpBuf)
+			if readErr != nil {
+				panic(readErr)
+			}
+
+			// ErrClosedPipe means we don't have any subscribers, this is ok if no peers have connected yet
+			if _, err = localTrackHelper.Write(rtpBuf[:i]); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				panic(err)
+			}
+		}
+
+		//RemotePeer := StreamInfo{}
+		//
+		//RemotePeer.Receiver = receiver
+		//
+		//if track.Kind() == webrtc.RTPCodecTypeAudio {
+		//	RemotePeer.AudioStream = track
+		//} else if track.Kind() == webrtc.RTPCodecTypeVideo {
+		//	RemotePeer.VideoStream = track
+		//}
+		//
+		//RemotePeerInfo = append(RemotePeerInfo, RemotePeer)
+		//
+		//fmt.Println(peerConnection.ConnectionState(), "connection state <-")
+
+		//for _, mappedPeerWithMaster := range MasterPeerConnectionMappedToUser {
+		//	trackLocal, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
+		//	if err != nil {
+		//		fmt.Println(err)
+		//	}
+		//	_, err = mappedPeerWithMaster.AddTrack(trackLocal)
+		//	if err != nil {
+		//		fmt.Println(err)
+		//	}
+		//}
 
 	})
 
